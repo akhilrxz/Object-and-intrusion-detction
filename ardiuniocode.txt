@@ -1,0 +1,196 @@
+#include <WiFi.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include "esp_camera.h"
+
+// Camera pins (AI-Thinker model)
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+#define FLASH_LED_PIN 4
+#define TRIGGER_PIN 12  // GPIO pin to monitor for trigger from Rugged Board
+
+// WiFi credentials
+const char* ssid = "THEJUS";
+const char* password = "akhil9496193075";
+
+// Server details
+String serverName = "192.168.1.5";
+String serverPath = "/ESP32CAM/upload_img.php";
+const int serverPort = 80;
+
+WiFiClient client;
+bool LED_Flash_ON = true;
+volatile bool triggerReceived = false;  // Flag for interrupt
+
+// Interrupt handler for GPIO trigger
+void IRAM_ATTR handleTrigger() {
+  triggerReceived = true;  // Set flag when trigger is received
+}
+
+void sendPhotoToServer() {
+  Serial.println("Taking photo...");
+  if (LED_Flash_ON) {
+    digitalWrite(FLASH_LED_PIN, HIGH);
+    delay(1000);  // Flash on for 1 second
+  }
+  
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    ESP.restart();
+    return;
+  }
+
+  if (LED_Flash_ON) {
+    digitalWrite(FLASH_LED_PIN, LOW);
+  }
+  
+  Serial.println("Photo captured");
+
+  if (client.connect(serverName.c_str(), serverPort)) {
+    Serial.println("Connected to server: " + serverName);
+    String boundary = "--dataMarker";
+    String head = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"imageFile\"; filename=\"ESP32CAMCap.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
+    String tail = "\r\n--" + boundary + "--\r\n";
+    
+    uint32_t imageLen = fb->len;
+    uint32_t totalLen = imageLen + head.length() + tail.length();
+    
+    client.println("POST " + serverPath + " HTTP/1.1");
+    client.println("Host: " + serverName);
+    client.println("Content-Length: " + String(totalLen));
+    client.println("Content-Type: multipart/form-data; boundary=" + boundary);
+    client.println();
+    client.print(head);
+    
+    uint8_t *fbBuf = fb->buf;
+    size_t fbLen = fb->len;
+    for (size_t n = 0; n < fbLen; n += 1024) {
+      if (n + 1024 < fbLen) {
+        client.write(fbBuf, 1024);
+        fbBuf += 1024;
+      } else {
+        size_t remainder = fbLen % 1024;
+        client.write(fbBuf, remainder);
+      }
+    }
+    client.print(tail);
+    
+    esp_camera_fb_return(fb);
+    
+    while (client.connected()) {
+      String line = client.readStringUntil('\n');
+      if (line == "\r") break;
+    }
+    String response = client.readString();
+    Serial.println("Server response: " + response);
+    client.stop();
+  } else {
+    Serial.println("Connection to server failed: " + serverName);
+    client.stop();
+  }
+}
+
+void setup() {
+  // Disable brownout detector
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  
+  Serial.begin(115200);
+  Serial.println("\nESP32-CAM Starting...");
+
+  // Initialize pins
+  pinMode(FLASH_LED_PIN, OUTPUT);
+  pinMode(TRIGGER_PIN, INPUT);
+
+  // Attach interrupt to trigger pin (trigger on rising edge)
+  attachInterrupt(digitalPinToInterrupt(TRIGGER_PIN), handleTrigger, RISING);
+
+  // WiFi setup
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  int attempts = 20;  // 10 seconds timeout (20 * 500ms)
+  while (WiFi.status() != WL_CONNECTED && attempts > 0) {
+    delay(500);
+    Serial.print(".");
+    attempts--;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected to WiFi");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nFailed to connect to WiFi");
+    ESP.restart();
+  }
+
+  // Camera setup
+  Serial.println("Initializing camera...");
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_UXGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 2;
+    Serial.println("PSRAM found, using UXGA frame size");
+  } else {
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 8;
+    config.fb_count = 1;
+    Serial.println("No PSRAM, using SVGA frame size");
+  }
+  
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
+    ESP.restart();
+  }
+  
+  sensor_t * s = esp_camera_sensor_get();
+  s->set_framesize(s, FRAMESIZE_SXGA);
+  Serial.println("Camera initialized successfully");
+}
+
+void loop() {
+  if (triggerReceived) {
+    Serial.println("Received GPIO trigger via interrupt");
+    sendPhotoToServer();
+    triggerReceived = false;  // Reset flag
+  }
+  delay(10);  // Small delay to prevent excessive CPU usage
+}
